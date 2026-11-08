@@ -80,6 +80,16 @@ and stop. This engine is the rest of the iceberg:
 - **Workspace RBAC** — one API key = one workspace + one role (`admin` ingests,
   `reader` queries). Every query is server-scoped to the caller's workspace in
   the retrieval SQL — the client filter can only narrow, never widen.
+- **Rate limiting** — per-API-key fixed-window limits through the same auth
+  dependency (`60/min`, `1200/hr`): `429` + `Retry-After`, fail-open on Redis
+  outage. See [Rate limiting](#rate-limiting).
+- **Task tenancy** — ingest tasks are pollable only from the workspace that
+  dispatched them; foreign or unknown task ids answer plain `404`.
+- **Ops surfaces** — admin-only Prometheus exposition (`/metrics`, zero
+  dependencies), structured JSON logs for log shippers, and a one-command
+  Postgres backup/restore story. See [Metrics & structured
+  logging](#metrics--structured-logging) and
+  [Backup & restore](#backup--restore).
 
 ---
 
@@ -348,14 +358,18 @@ rag-engine/
 ├── src/rag_engine/
 │   │
 │   ├── api/
-│   │   ├── app.py                 # FastAPI app + lifespan (model preload)
-│   │   ├── auth.py                # API keys → workspace + role, scoped filters
+│   │   ├── app.py                 # FastAPI app + lifespan (model preload, JSON logs, metrics middleware)
+│   │   ├── auth.py                # API keys → workspace + role + key_id, rate-limit choke point
+│   │   ├── ratelimit.py           # per-key fixed-window limiter (Redis, fail-open)
+│   │   ├── ownership.py           # task_owner stamps + /tasks tenancy verification
+│   │   ├── metrics.py             # in-process Prometheus exposition builder
 │   │   ├── deps.py                # SessionDep
 │   │   └── routes/
-│   │       ├── ingest.py          # POST /ingest
+│   │       ├── ingest.py          # POST /ingest (records task owner)
 │   │       ├── query.py           # POST /query
 │   │       ├── query_stream.py    # POST /query/stream (SSE)
-│   │       └── tasks.py           # GET  /tasks/{id}
+│   │       ├── tasks.py           # GET  /tasks/{id} (ownership-verified)
+│   │       └── metrics_route.py   # GET  /metrics (admin-only)
 │   │
 │   ├── ingestion/
 │   │   ├── parsers.py             # PDF / DOCX / HTML / MD → blocks
@@ -377,6 +391,7 @@ rag-engine/
 │   │   └── runner.py              # eval harness
 │   │
 │   ├── config.py                  # Settings (pydantic-settings)
+│   ├── logging_setup.py           # structured JSON log formatter
 │   ├── db.py                      # async engine + SessionFactory
 │   ├── models.py                  # Document, Chunk
 │   └── worker.py                  # Celery app + ingest task
@@ -386,15 +401,29 @@ rag-engine/
 │   ├── script.py.mako             # template injects CREATE EXTENSION
 │   └── versions/                  # generated revisions
 │
+├── scripts/
+│   ├── backup.sh                  # pg_dump → backups/*.sql.gz
+│   ├── restore.sh                 # replay a backup
+│   ├── seed_eval.sh               # ingest eval corpus with stable titles
+│   ├── eval.py                    # retrieval-quality gate (thresholded)
+│   └── manual_test.sh             # live battery (auth/RBAC/tenancy/limits)
+│
 ├── tests/
-│   ├── eval_set.json              # labeled evaluation cases
+│   ├── conftest.py                # suite env: rate limiter disabled autouse
+│   ├── eval_set.json              # labeled evaluation cases (title keys)
 │   ├── test_metrics.py            # ranking-metric unit tests
 │   ├── test_sanitize.py           # prompt-injection hardening tests
 │   ├── test_pii.py                # PII masking + policy wiring tests
-│   └── test_auth.py               # API-key auth, roles, workspace scoping
+│   ├── test_auth.py               # API-key auth, roles, workspace scoping
+│   ├── test_ratelimit.py          # limiter windows + fail-open
+│   ├── test_ownership.py          # task tenancy 404/fail-open
+│   ├── test_metrics_endpoint.py   # exposition builder
+│   └── test_key_storage.py        # hashed RAG_API_KEYS storage/revocation
 │
 ├── docs/
-│   └── sample.md                  # demo document
+│   ├── sample.md                  # demo document
+│   ├── acme_runbook.md            # battery + eval corpus (workspace acme)
+│   └── globex_handbook.md         # battery + eval corpus (workspace globex)
 │
 ├── docker-compose.yaml
 ├── alembic.ini                    # must match DATABASE_URL port
@@ -459,7 +488,9 @@ corpus-level IDF (Inverse Document Frequency) weighting, swap in ParadeDB or use
 All endpoints below /health require credentials: `Authorization: Bearer
 <api-key>` or `X-API-Key: <api-key>`. See
 [Authentication & workspaces](#authentication--workspaces); each caller reads
-and writes **its own workspace only**.
+and writes **its own workspace only**. Every credential also passes the
+per-key rate limiter — bursts answer `429` + `Retry-After` (see
+[Rate limiting](#rate-limiting)).
 
 ### `POST /ingest`
 
@@ -523,6 +554,13 @@ Possible `result` values:
 
 On `FAILURE`, `result` is `{"error": "<message>"}` — a short message only.
 Celery's full traceback is logged server-side, never returned to the client.
+
+**Tenancy:** the task is owned by the workspace that dispatched it. Callers from
+other workspaces — and callers polling unknown ids — get `404` (not `403`), so
+polling can't be used to probe task-id space. Ownership is stamped in Redis at
+dispatch (`task_owner:<task_id>`, TTL 7 days) and re-verified on every poll.
+Only an infrastructure failure to reach Redis keeps the route usable
+(fail-open); a nonexistent owner record is still a hard `404`.
 
 ### `POST /query`
 
@@ -617,6 +655,36 @@ is unreachable. Use this for liveness/ready probes.
 
 ---
 
+### `GET /metrics` *(admin only)*
+
+Prometheus text exposition (format 0.0.4) for the running API process. Reads
+require `role: admin`; reader keys get `403`, anonymous gets `401`.
+
+```text
+# HELP rag_engine_requests_total HTTP requests served
+# TYPE rag_engine_requests_total counter
+rag_engine_requests_total{method="GET",path="/health",status="200"} 3
+...
+# HELP rag_engine_request_latency_seconds Per-route latency (last N samples)
+# TYPE rag_engine_request_latency_seconds summary
+rag_engine_request_latency_seconds_quantile{method="GET",path="/query",quantile="0.9"} 0.412
+rag_engine_celery_queue_depth 0
+rag_engine_uptime_seconds 1234.5
+```
+
+Implemented with zero dependencies: request counters + latency summaries
+(p50/p90/p99 over bounded in-memory samples) in the API process, plus a
+>Celery queue-depth gauge (best-effort; a Redis hiccup degrades only that
+gauge, never the scrape). Counters are per replica — aggregating across
+replicas is the scraper's job on the usual multi-replica deployment.
+Path cardinality is bounded: matched routes record by their templated path
+(`/tasks/<uuid>` → `/tasks/{task_id}`), and unmatched requests (404 scans,
+probes) collapse into a single `{unmatched}` bucket — arbitrary request
+paths can't grow the exposition. Exposition never includes API keys,
+query strings, or telemetry beyond method/path-template/status.
+
+---
+
 ## Configuration
 
 All settings resolve in this order (highest priority first):
@@ -633,7 +701,7 @@ All settings resolve in this order (highest priority first):
 | `EMBED_DIM` | `384` | `1024` for bge-m3; `models.py` derives `HALFVEC(dim)` from it |
 | `RERANK_MODEL` | `ms-marco-MiniLM-L-6-v2` (quick start) | Production: `BAAI/bge-reranker-v2-m3` (multilingual) |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible: Ollama (`http://localhost:11434/v1`), vLLM, LM Studio… |
-| `LLM_API_KEY` | `sk-change-me` | Placeholder the server ignores for local servers like Ollama (any non-empty value works) |
+| `LLM_API_KEY` | *(empty)* | `SecretStr` (masked in any repr/log). Required for hosted providers — the client fails fast with a clear error; ignored by local servers like Ollama |
 | `LLM_MODEL` | `gpt-4o-mini` | e.g. `llama3.2:3b` with Ollama |
 | `CHUNK_SIZE` | `800` | Tokens |
 | `CHUNK_OVERLAP` | `120` | Tokens |
@@ -644,7 +712,10 @@ All settings resolve in this order (highest priority first):
 | `UPLOAD_MAX_BYTES` | `64 MB` | Per-file upload cap (larger → HTTP 413) |
 | `PII_MASKING` | `llm_only` | `off` / `llm_only` (mask before the LLM) / `all` (also mask at ingest) |
 | `PII_MASK_STYLE` | `replace` | `replace` (`[EMAIL]`) or `pseudonymize` (`EMAIL_3f2a81c0`) |
-| `RAG_API_KEYS` | *(none)* | JSON: `{"<key>": {"workspace": "...", "role": "admin\|reader"}}`; unset ⇒ everything returns `401` |
+| `RAG_API_KEYS` | *(none)* | JSON: `{"<key>": {"workspace": "...", "role": "admin\|reader"}}`; unset ⇒ everything returns `401`. Stored **hashed** in memory (SHA-256) — config never reprs or logs plaintext keys, and the process env fully replaces the `.env` value (no merge) so revocations take effect |
+| `RATE_LIMIT_ENABLED` | `true` | Per-key fixed-window limiter (`false` bypasses it; Redis failures always fail open regardless) |
+| `RATE_LIMIT_PER_MINUTE` | `60` | Sustained burst ceiling per API key — exceeded ⇒ `429` + `Retry-After` |
+| `RATE_LIMIT_PER_HOUR` | `1200` | Abuse ceiling per API key per hour; `0` disables this window individually |
 
 **Setting these correctly matters.** A `DATABASE_URL` on 5432 will connect to a
 local Homebrew Postgres if one is running, and the failure will be
@@ -869,22 +940,22 @@ markers already referring to those cited entries.
 [
   {
     "question": "What is the deployment rollback procedure?",
-    "relevant": ["<doc_uuid>", "docs/handbook.md"]
+    "relevant": ["Acme Runbook"]
   },
   {
     "question": "What is the maximum operating temperature?",
-    "relevant": ["<doc_uuid>"]
+    "relevant": ["Acme Runbook", "docs/runbook.md", "<doc_uuid>"]
   }
 ]
 ```
 
-`relevant` accepts **either** `documents.id` UUIDs **or** `documents.source_uri`
-values. Each retrieved chunk counts at most once: if either identifier is in
-the relevant set, the chunk contributes a single hit (matching on both
-identifiers for the same chunk would inflate **MRR** and **NDCG**). Useful when
-you have a stable corpus but chunk IDs change between re-ingestions.
-
-Get the UUIDs:
+`relevant` accepts any of **`documents.id`** UUIDs, `documents.source_uri`
+values, or `documents.title` values. Each retrieved chunk counts at most once:
+if any identifier is in the relevant set, the chunk contributes a single hit.
+Several chunks of one doc all map to the same identifier and collapse to that
+identifier's best rank — so binary relevance stays doc-level and **NDCG**
+stays within `[0, 1]`. Titles are handy when chunk IDs and UUIDs change
+between re-ingestions but the corpus (and its names) stay fixed.
 
 ```bash
 docker compose exec postgres psql -U rag -d rag -c \
@@ -893,8 +964,34 @@ docker compose exec postgres psql -U rag -d rag -c \
 
 ### Run the harness
 
+Seed the corpus with deterministic titles, then run the gate:
+
 ```bash
-uv run python -c "
+bash scripts/seed_eval.sh   # ingests docs/ corpus with eval titles
+python scripts/eval.py      # scores tests/eval_set.json, k=10
+```
+
+`scripts/eval.py` prints the three aggregates plus per-case diagnostics and
+**exits non-zero when any threshold fails** — the same gate CI will enforce:
+
+```json
+{
+  "n": 4,
+  "recall@10": 1.0,
+  "mrr": 1.0,
+  "ndcg@10": 1.0
+}
+```
+
+```text
+per case:
+  OK  recall=1.00 mrr=1.00 ndcg=1.00  What is the maximum operating ...
+GATE PASSED
+```
+
+The raw runner (no thresholds) is also importable:
+
+```python
 import asyncio, json
 from rag_engine.db import SessionFactory
 from rag_engine.evaluation.runner import run_eval
@@ -904,22 +1001,6 @@ async def main():
         print(json.dumps(await run_eval(s, 'tests/eval_set.json', k=10), indent=2))
 
 asyncio.run(main())
-"
-```
-
-**Output:**
-
-```json
-{
-  "n": 25,
-  "recall@10": 0.92,
-  "mrr": 0.74,
-  "ndcg@10": 0.81,
-  "per_case": [
-    {"question": "...", "recall": 1.0, "mrr": 1.0, "ndcg": 1.0},
-    ...
-  ]
-}
 ```
 
 ### Metrics explained
@@ -1013,6 +1094,88 @@ sending the same malformed request cannot leak internals into one another's
 responses. Upstream **LLM provider** failures (bad key, quota replies, 5xx)
 are caught separately and surfaced as `502 generation failed` (`503` on
 rate-limit), keeping the raw `500` reserved for genuine server bugs.
+
+### Rate limiting
+
+Per-API-key fixed-window limiting, enforced in `require_caller` — the single
+dependency every guarded route already goes through, so there is no second
+path that forgets it. Two independent Redis counters per key digest (never
+the plaintext token):
+
+| Window | Default | Catches |
+|---|---|---|
+| per minute | `60` | burst storms, runaway poll loops, retry stampedes |
+| per hour | `1200` | sustained scraping / abuse from one credential |
+
+Exceeding either returns `429` with a `Retry-After` header aligned to the
+window's edge. Fail-open on Redis errors: the limiter protects the API from
+*callers*, and a limiter that turns a Redis outage into a full API outage
+would be a bigger vulnerability than the abuse it prevents (clients carry
+short socket timeouts so a *hung* Redis degrades to an error, not a block).
+Tune or disable with `RATE_LIMIT_ENABLED` / `RATE_LIMIT_PER_MINUTE` /
+`RATE_LIMIT_PER_HOUR`.
+
+**Failed auth shares a bucket.** The limiter runs after a key authenticates;
+invalid or missing credentials have no digest and instead draw against one
+shared fixed-rate bucket with the same 60/min / 1200/hr ceilings — unlimited
+key-probing and `401` floods are not free, and a flood can't lock out
+legitimate callers (they never touch that bucket). Legit callers with a
+typo'd key see `429` with `Retry-After` instead of `401` past the shared
+ceiling for that minute.
+
+### Task ownership (tenancy for `/tasks/{id}`)
+
+Celery has no concept of who enqueued a task, so `POST /ingest` stamps
+`task_owner:<task_id> → workspace` in Redis (TTL 7 days) at dispatch, and
+every `/tasks/{task_id}` poll verifies the caller's workspace against it.
+Foreign and unknown task ids return `404` — the same status for "not yours"
+and "doesn't exist", so polling can't probe id space. Fail-closed on missing
+ownership records (pre-upgrade tasks stay unlinkable), fail-open only when
+Redis itself is unreachable so polling survives a Redis outage. With no
+stamping mechanism and no verification, any authenticated caller could read
+any workspace's ingest status.
+
+### Metrics & structured logging
+
+- **Metrics** — `GET /metrics` (admin-only, see [API reference](#get-metrics-admin-only)).
+  Dependency-free Prometheus exposition; recorded for every request by a
+  FastAPI middleware.
+- **Structured logs** — `logging_setup.configure_structured_logging()` swaps
+  the root and `uvicorn` handlers to JSON lines (`ts`, `level`, `logger`,
+  `msg`, `exc`) at app startup, so `docker logs` output parses directly in
+  Loki/Beats/CloudWatch. Applications loggers under `rag_engine.*` and
+  uvicorn's own access/error logs all emit one JSON object per line.
+- **Secrets boundaries** — plaintext API keys and `LLM_API_KEY` are never
+  repr'd, logged, or exposed in metrics: config stores SHA-256 digests of
+  `RAG_API_KEYS` entries, the LLM key is a `SecretStr`, and tracebacks from
+  user task failures are trimmed to a short message before entering a
+  response.
+
+### Backup & restore
+
+All tenanted state — chunks, embeddings(†), metadata — lives in one Postgres,
+so one dump is one consistent DR snapshot with nothing to race or resync:
+
+```bash
+bash scripts/backup.sh                 # → backups/rag-<UTC stamp>.sql.gz
+bash scripts/restore.sh backups/rag-20261108T120000Z.sql.gz
+```
+
+`backup.sh` runs `pg_dump` inside the compose service and gzips; `restore.sh`
+replays with `ON_ERROR_STOP=1` into the same service (brief downtime — the DB
+is removed and rebuilt). Verify restores regularly: an untested backup has
+never restored anything. The `backups/` directory is gitignored.
+
+**Not covered by the dump:** Redis-only state — notably the
+`task_owner:<id>` ownership stamps (TTL 7 days) and rate-limit counters.
+After a DR restore, in-flight tasks lose their ownership stamp and answer
+`404` to every poll (fail-closed until their Celery results expire, ~1 day
+by default). Recreating the corpus from source documents is safe and
+idempotent; task *polling* state is simply gone. If task tracking must
+survive DR, promote those stamps into Postgres in a future revision.
+
+(†) Embedding columns live alongside chunk rows in the same database — see
+[Database schema](#database-schema).
 
 ### PII masking
 
@@ -1156,6 +1319,17 @@ docker compose exec postgres psql -U rag -d rag -c "SELECT extversion FROM pg_ex
 redis-cli -p 6380 ping
 redis-cli -p 6380 monitor        # watch Celery traffic in real time
 redis-cli -p 6380 keys 'qemb:*'  # query embedding cache
+redis-cli -p 6380 keys 'task_owner:*'  # ingest-task ownership stamps
+```
+
+### Ops: metrics / backup / eval
+
+```bash
+curl -s localhost:8000/metrics -H "X-API-Key: $ADMIN_KEY"   # Prometheus scrape
+bash scripts/backup.sh                                      # pg_dump → backups/*.sql.gz
+bash scripts/restore.sh backups/rag-20261108T120000Z.sql.gz  # replay a dump
+bash scripts/seed_eval.sh                                   # load eval corpus with stable titles
+python scripts/eval.py                                      # quality gate (non-zero on failure)
 ```
 
 ### Testing
@@ -1187,13 +1361,19 @@ asyncio.run(main())
 
 ### Unit tests
 
-Three suites, all offline (no Postgres/Redis/Docker needed):
+Eight suites, all offline (no Postgres/Redis/Docker needed — `tests/conftest.py`
+disables the rate limiter everywhere except its own tests):
 
 | File | Covers |
 |---|---|
 | `tests/test_metrics.py` | `recall_at_k`, `mrr`, `ndcg_at_k` correctness and bounds |
 | `tests/test_sanitize.py` | Prompt-injection hardening: fence breakouts, role spoofing, special-token and control-character neutralization, truncation keeps fences closed |
 | `tests/test_pii.py` | PII detection/masking per class, Luhn false-positive control, `pseudonymize` determinism, policy wiring in `build_context` (`off`/`llm_only`/`all`) |
+| `tests/test_auth.py` | Bearer/`X-API-Key` parsing, unknown-key `401`, role gating |
+| `tests/test_key_storage.py` | `RAG_API_KEYS` hashed storage: digest map build, blank-key drop, env replacement (revocation) semantics |
+| `tests/test_ratelimit.py` | Limiter windows (`429` + `Retry-After`), disabled bypass, fail-open on Redis outage |
+| `tests/test_ownership.py` | Task tenancy: owner passes, foreign/unknown `404`, fail-open on Redis outage |
+| `tests/test_metrics_endpoint.py` | Exposition builder: route-template collapse, counters, latency summaries, no key material |
 
 A spot-check from `tests/test_metrics.py`:
 
@@ -1234,14 +1414,16 @@ uv run pytest -v
 ### Integration test (live stack)
 
 `scripts/manual_test.sh` exercises the whole stack against a running API +
-worker — 22 checks covering auth, RBAC, upload validation, idempotent
-re-ingest, cross-workspace isolation, streaming, and error handling:
+worker — 31 checks covering auth, RBAC, upload validation, idempotent
+re-ingest, cross-workspace isolation, streaming, error handling, task
+tenancy (`404` for foreign task ids), metrics role-gating, and `429` on a
+rate-limit burst:
 
 ```bash
 # Prereqs: `docker compose up -d`, worker + API running (see Quickstart),
 # 4 API keys configured (acme admin/reader, globex admin/reader).
 bash scripts/manual_test.sh
-# → "=== 22 passed, 0 failed ==="
+# → "=== 31 passed, 0 failed ==="
 ```
 
 The battery is idempotent: re-running the same documents yields
@@ -1274,27 +1456,42 @@ curl -N -X POST http://localhost:8000/query/stream \
 
 ### CI gate
 
-Add to your CI/CD (Continuous Integration / Continuous Delivery) pipeline:
+CI lives in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and runs on
+every push to `main` and every PR:
 
-```yaml
-- run: uv run ruff check src/
-- run: uv run ty check src/
-- run: uv run pytest
-- run: uv run python -c "
-    import asyncio, json
-    from rag_engine.db import SessionFactory
-    from rag_engine.evaluation.runner import run_eval
-    async def main():
-        async with SessionFactory() as s:
-            r = await run_eval(s, 'tests/eval_set.json')
-            assert r['recall@10'] >= 0.85, r
-            assert r['mrr'] >= 0.65, r
-            assert r['ndcg@10'] >= 0.70, r
-    asyncio.run(main())
-    "
-```
+| Check | Command |
+|---|---|
+| **Lint** | `uv run ruff check src/ tests/` |
+| **Type check** | `uv run ty check src/ tests/` |
+| **Unit tests** (55+, two seconds) | `uv run pytest tests/ -q` |
 
-Retrieval quality is a build gate, not a post-deploy surprise.
+It runs on `ubuntu-latest` with **uv** (Python 3.14 via setup-uv) — no
+Postgres/Redis services are needed: the unit suite is offline by design
+(parsers, PII, sanitization, metrics, auth, config). Model downloads and the
+database are deliberately left out of CI; see the live-battery test for
+stack-level checks instead.
+
+> **Retrieval quality as a build gate:** once a `tests/eval_set.json` dataset
+> exists, add a job with Postgres (+pgvector) and Redis services that runs
+> `alembic upgrade head` and asserts recall/MRR/NDCG thresholds. The runner
+> interface is `run_eval(session, dataset_path)`, e.g.:
+>
+> ```python
+> import asyncio
+> from rag_engine.db import SessionFactory
+> from rag_engine.evaluation.runner import run_eval
+>
+> async def main():
+>     async with SessionFactory() as s:
+>         r = await run_eval(s, "tests/eval_set.json")
+>         assert r["recall@10"] >= 0.85, r
+>         assert r["mrr"] >= 0.65, r
+>         assert r["ndcg@10"] >= 0.70, r
+>
+> asyncio.run(main())
+> ```
+>
+> Retrieval quality should be a build gate, not a post-deploy surprise.
 
 ---
 

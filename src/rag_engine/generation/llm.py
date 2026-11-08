@@ -26,8 +26,44 @@ def get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
         s = get_settings()
-        _client = AsyncOpenAI(base_url=s.llm_base_url, api_key=s.llm_api_key)
+        key = s.llm_api_key.get_secret_value()
+        # Fail fast with an actionable message instead of letting the upstream
+        # client raise a confusing 401 mid-generation. Local servers (Ollama,
+        # LM Studio) ignore the key entirely, so an empty one is only an error
+        # when the host is actually a remote, keyed provider.
+        if not key and _is_public_provider(s.llm_base_url):
+            raise RuntimeError(
+                "LLM_API_KEY is not set. Point LLM_BASE_URL at a local server "
+                "(e.g. http://localhost:11434/v1 for Ollama) or set a real API "
+                "key for the configured provider in .env."
+            )
+        _client = AsyncOpenAI(base_url=s.llm_base_url, api_key=key)
     return _client
+
+
+def _is_public_provider(base_url: str) -> bool:
+    """True when the configured endpoint is a hosted, keyed service."""
+    from urllib.parse import urlparse
+
+    host = (urlparse(base_url).hostname or "").lower()
+    # Local hostnames and RFC1918 / loopback ranges are never public. IPv6
+    # loopback arrives as "::1" from urlparse; mangling an unbracketed bare
+    # host isn't valid either way, so treating it local fails safe.
+    if (
+        host in ("localhost", "127.0.0.1", "::1", "host.docker.internal")
+        or host.endswith(".local")
+        or host.startswith(("10.", "192.168.", "127."))
+    ):
+        return False
+    parts = host.split(".")
+    is_private_172 = (
+        len(parts) == 4 and all(p.isdigit() for p in parts) and parts[0] == "172" and 16 <= int(parts[1]) <= 31
+    )
+    # Gap (deliberate): an intranet server at a public-looking DNS name
+    # (vllm.corp.example) is treated as public → boot demands an API key.
+    # Failing strict is safe; pass a throwaway key for keyless intranet
+    # servers rather than teaching this check about DNS.
+    return not is_private_172
 
 
 async def generate_answer(query: str, context: str) -> str:

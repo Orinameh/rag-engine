@@ -7,6 +7,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from rag_engine.api.auth import AdminDep
+from rag_engine.api.ownership import record_owner
 from rag_engine.config import get_settings
 from rag_engine.worker import ingest_document
 
@@ -75,4 +76,8 @@ async def ingest(
     task: AsyncResult = ingest_document.apply_async(
         args=(str(dest), title, authority, workspace)
     )
+    # Tenancy stamping: tasks polls must belong to the dispatching workspace
+    # (api/ownership.py). Best-effort: a Redis hiccup yields an un-pollable
+    # task rather than a pollable-by-anyone task (fail-closed).
+    await record_owner(task.id, workspace)
     return IngestResponse(task_id=task.id, status_url=f"/tasks/{task.id}")

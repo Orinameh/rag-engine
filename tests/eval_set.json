@@ -1,0 +1,18 @@
+[
+  {
+    "question": "What is the maximum operating temperature before contacting ops?",
+    "relevant": ["Acme Runbook"]
+  },
+  {
+    "question": "What is the deployment rollback window after a failed release?",
+    "relevant": ["Acme Runbook"]
+  },
+  {
+    "question": "What is the springfield calibration phrase?",
+    "relevant": ["Globex Handbook"]
+  },
+  {
+    "question": "What packaging standard applies to board-level electronics?",
+    "relevant": ["Globex Handbook"]
+  }
+]

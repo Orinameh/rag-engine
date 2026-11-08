@@ -4,6 +4,7 @@ from celery.result import AsyncResult
 from fastapi import APIRouter
 
 from rag_engine.api.auth import CallerDep
+from rag_engine.api.ownership import verify_access
 from rag_engine.worker import celery_app
 
 logger = logging.getLogger(__name__)
@@ -13,6 +14,10 @@ router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 @router.get("/{task_id}")
 async def task_status(task_id: str, caller: CallerDep) -> dict:
+    # Tenancy: a task dispatched by workspace A's admin may be polled only by
+    # workspace A callers. Unknown/un-owned ids 404 (no existence leak);
+    # infrastructure failure to reach Redis fails open (route availability).
+    await verify_access(task_id, caller.workspace)
     res = AsyncResult(task_id, app=celery_app)
     if not res.ready():
         return {"task_id": task_id, "state": res.state, "result": None}

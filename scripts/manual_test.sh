@@ -138,4 +138,53 @@ fi
 not_in "no traceback leaked to client" "traceback" "$B"
 
 echo
+echo "== 11. Task ownership: cross-workspace polling =="
+# $GT is the globex-owned task from section 7; acme callers must not see it.
+C=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/tasks/$GT" -H "X-API-Key: sk-acme-admin")
+if [[ "$C" == "404" ]]; then
+  echo "✅ acme polling globex task → 404"; PASS=$((PASS+1))
+else
+  echo "❌ acme polling globex task → $C (want 404)"; FAIL=$((FAIL+1))
+fi
+C=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/tasks/$GT" -H "X-API-Key: sk-globex-reader")
+if [[ "$C" == "200" ]]; then
+  echo "✅ globex polling its own task → 200"; PASS=$((PASS+1))
+else
+  echo "❌ globex polling own task → $C (want 200)"; FAIL=$((FAIL+1))
+fi
+C=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/tasks/00000000-0000-4000-8000-000000000000" -H "X-API-Key: sk-acme-admin")
+if [[ "$C" == "404" ]]; then
+  echo "✅ unknown task id → 404 (no existence leak)"; PASS=$((PASS+1))
+else
+  echo "❌ unknown task id → $C (want 404)"; FAIL=$((FAIL+1))
+fi
+
+echo "== 12. Metrics endpoint: admin-only + exposition =="
+C=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/metrics" -H "X-API-Key: sk-acme-admin")
+check "admin scrape → 200" "200" "$C"
+C=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/metrics" -H "X-API-Key: sk-acme-reader")
+if [[ "$C" == "403" ]]; then echo "✅ reader scrape → 403"; PASS=$((PASS+1)); else echo "❌ reader scrape → $C (want 403)"; FAIL=$((FAIL+1)); fi
+C=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/metrics")
+if [[ "$C" == "401" ]]; then echo "✅ anon scrape → 401"; PASS=$((PASS+1)); else echo "❌ anon scrape → $C (want 401)"; FAIL=$((FAIL+1)); fi
+M=$(curl -s "$BASE/metrics" -H "X-API-Key: sk-acme-admin")
+not_in "exposition never leaks key material" "sk-" "$M"
+grep -q "rag_engine_requests_total" <<<"$M" && { echo "✅ exposition has request counters"; PASS=$((PASS+1)); } || { echo "❌ no request counter"; FAIL=$((FAIL+1)); }
+
+echo "== 13. Rate limiting: 429 on burst =="
+# 65 fast authed polls as one reader: per-minute limit is 60 → the tail must
+# start answering 429 with Retry-After. (Do this last: it exhausts the key's
+# minute budget and would pollute later sections.)
+FOUR29S=0
+RETRY=""
+for _ in $(seq 1 65); do
+  R=$(curl -s -m 5 -D - -o /dev/null "$BASE/tasks/00000000-0000-4000-8000-000000000000" -H "X-API-Key: sk-acme-reader" 2>/dev/null | tr -d '\r')
+  grep -q "^HTTP/ 429\|^HTTP/1.1 429\|^HTTP/1.0 429\|^HTTP/2 429" <<<"$R" && { FOUR29S=$((FOUR29S+1)); [ -z "$RETRY" ] && RETRY=$(grep -i '^retry-after:' <<<"$R"); }
+done
+if [[ "$FOUR29S" -ge 1 ]]; then
+  echo "✅ burst throttled: $FOUR29S/65 requests got 429 ($([ -n "$RETRY" ] && echo "Retry-After present" || echo "note: no Retry-After header"))"; PASS=$((PASS+1))
+else
+  echo "❌ burst got zero 429s (limit multiplier or limiter broken?)"; FAIL=$((FAIL+1))
+fi
+
+echo
 echo "=== $PASS passed, $FAIL failed ==="

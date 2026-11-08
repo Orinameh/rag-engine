@@ -16,4 +16,7 @@ docs/uploads/
 # Virtual environments
 .venv
 
+# Ops backups (scripts/backup.sh writes here)
+backups/
+
 
