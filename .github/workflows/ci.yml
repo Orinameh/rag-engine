@@ -45,3 +45,36 @@ jobs:
 
       - name: pytest (unit tests)
         run: uv run pytest tests/ -q --tb=short
+
+  # Backs the "CI gate" story: a passing test run is worthless if the
+  # package no longer ships. Builds sdist + wheel (uv_build backend), then
+  # installs JUST the wheel in a scratch venv and imports the package —
+  # catching missing modules/deps that tests never trip because they run
+  # from the source tree with uv's dev resolution.
+  build:
+    name: build (sdist + wheel)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Build
+        run: uv build
+
+      - name: Wheel installs and imports clean (no source tree, no dev deps)
+        run: |
+          uv venv verify
+          uv pip install --python verify/bin/python dist/*.whl
+          verify/bin/python -c "import rag_engine; import importlib, rag_engine.api.app; print('wheel OK:', rag_engine.__name__)"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && github.ref == 'refs/heads/main'
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7

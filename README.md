@@ -1461,9 +1461,10 @@ every push to `main` and every PR:
 
 | Check | Command |
 |---|---|
-| **Lint** | `uv run ruff check src/ tests/` |
-| **Type check** | `uv run ty check src/ tests/` |
-| **Unit tests** (55+, two seconds) | `uv run pytest tests/ -q` |
+| **Lint** | `uv run ruff check src/ tests/ scripts/eval.py` |
+| **Type check** | `uv run ty check src/ tests/ scripts/eval.py` |
+| **Unit tests** (75, three seconds) | `uv run pytest tests/ -q` |
+| **Build** | `uv build`, then the wheel is installed into a scratch venv and imported — packaging regressions (missing modules, undeclared deps) fail the build |
 
 It runs on `ubuntu-latest` with **uv** (Python 3.14 via setup-uv) — no
 Postgres/Redis services are needed: the unit suite is offline by design
