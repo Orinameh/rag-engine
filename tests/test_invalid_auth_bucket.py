@@ -35,6 +35,9 @@ async def test_unknown_key_counts_against_invalid_bucket(monkeypatch):
         )
     assert err.value.status_code == 401
     assert seen == [ratelimit_mod.INVALID_AUTH_BUCKET]
+    # RFC 6750: 401s from a Bearer resource advertise the scheme.
+    headers = err.value.headers or {}
+    assert headers["WWW-Authenticate"] == 'Bearer realm="rag"'
 
 
 @pytest.mark.anyio
@@ -50,6 +53,7 @@ async def test_missing_credentials_count_against_invalid_bucket(monkeypatch):
         await auth_mod.require_caller(authorization=None, x_api_key=None)
     assert err.value.status_code == 401
     assert seen == [ratelimit_mod.INVALID_AUTH_BUCKET]
+    assert (err.value.headers or {})["WWW-Authenticate"] == 'Bearer realm="rag"'
 
 
 @pytest.mark.anyio

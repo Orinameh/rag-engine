@@ -488,9 +488,12 @@ corpus-level IDF (Inverse Document Frequency) weighting, swap in ParadeDB or use
 All endpoints below /health require credentials: `Authorization: Bearer
 <api-key>` or `X-API-Key: <api-key>`. See
 [Authentication & workspaces](#authentication--workspaces); each caller reads
-and writes **its own workspace only**. Every credential also passes the
+and writes **its own workspace only**. `401` responses carry
+`WWW-Authenticate: Bearer` (RFC 6750), and every credential also passes the
 per-key rate limiter — bursts answer `429` + `Retry-After` (see
-[Rate limiting](#rate-limiting)).
+[Rate limiting](#rate-limiting)). The interactive docs (`/docs`, `/openapi.json`)
+are disabled unless `DOCS_ENABLED=true` — they cannot be authenticated, so
+they are off in production.
 
 ### `POST /ingest`
 
@@ -716,6 +719,7 @@ All settings resolve in this order (highest priority first):
 | `RATE_LIMIT_ENABLED` | `true` | Per-key fixed-window limiter (`false` bypasses it; Redis failures always fail open regardless) |
 | `RATE_LIMIT_PER_MINUTE` | `60` | Sustained burst ceiling per API key — exceeded ⇒ `429` + `Retry-After` |
 | `RATE_LIMIT_PER_HOUR` | `1200` | Abuse ceiling per API key per hour; `0` disables this window individually |
+| `DOCS_ENABLED` | `false` | Serve unauthenticated `/docs`, `/redoc`, `/openapi.json`. Off by default (they leak the full API schema to anonymous callers); enable for development only |
 
 **Setting these correctly matters.** A `DATABASE_URL` on 5432 will connect to a
 local Homebrew Postgres if one is running, and the failure will be

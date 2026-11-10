@@ -19,3 +19,13 @@ def test_quick_start_profile_is_light():
     # Defaults must be small enough that first startup doesn't fetch GBs.
     assert "MiniLM" in s.embed_model or "small" in s.embed_model
     assert s.embed_dim <= 512
+
+
+def test_docs_disabled_by_default(monkeypatch):
+    """Unauthenticated /docs & /openapi.json must be off unless explicitly on."""
+    monkeypatch.delenv("DOCS_ENABLED", raising=False)
+    get_settings.cache_clear()
+    try:
+        assert get_settings().docs_enabled is False
+    finally:
+        get_settings.cache_clear()

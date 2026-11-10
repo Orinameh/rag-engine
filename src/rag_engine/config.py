@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 60
     rate_limit_per_hour: int = 1200
 
+    # Unauthenticated /docs, /redoc, /openapi.json are off by default
+    # (app.py). Enable only for development.
+    docs_enabled: bool = False
+
     # Authentication & tenancy. RAG_API_KEYS is a JSON object mapping key →
     # workspace/role, e.g.
     #   RAG_API_KEYS='{"sk-acme-admin": {"workspace": "acme", "role": "admin"},

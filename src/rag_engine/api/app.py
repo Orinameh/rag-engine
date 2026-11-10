@@ -88,7 +88,18 @@ async def metrics_middleware(request: Request, call_next):  # type: ignore[no-un
             logger.debug("metrics recording failed: %s", exc)
 
 
-app = FastAPI(title="RAG Engine", version="0.1.0", lifespan=lifespan)
+# Interactive docs (/docs, /redoc, /openapi.json) are OFF by default: they
+# are unauthenticated by nature and handing anonymous callers the full API
+# schema is pointless surface for a production deployment. Set
+# DOCS_ENABLED=true for development convenience.
+app = FastAPI(
+    title="RAG Engine",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url="/docs" if get_settings().docs_enabled else None,
+    redoc_url="/redoc" if get_settings().docs_enabled else None,
+    openapi_url="/openapi.json" if get_settings().docs_enabled else None,
+)
 
 app.middleware("http")(metrics_middleware)
 

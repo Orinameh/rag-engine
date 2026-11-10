@@ -27,6 +27,10 @@ from pydantic import BaseModel
 from rag_engine.api.ratelimit import INVALID_AUTH_BUCKET, check_rate_limit
 from rag_engine.config import ApiKeyEntry, get_settings
 
+# RFC 6750: a 401 from a Bearer-protected resource should carry this header —
+# it tells standards-compliant clients (and humans) which scheme was expected.
+_WWW_AUTH = {"WWW-Authenticate": 'Bearer realm="rag"'}
+
 
 class Caller(BaseModel):
     """The authenticated principal for one request.
@@ -65,6 +69,7 @@ def authenticate(token: str) -> Caller:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or unknown API key",
+            headers=_WWW_AUTH,
         )
     return Caller(
         workspace=entry.workspace, role=entry.role, key_id=key_digest(token)
@@ -88,6 +93,7 @@ async def require_caller(
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Authorization header must be 'Bearer <api-key>'",
+                headers=_WWW_AUTH,
             )
     if token is None:
         token = x_api_key
@@ -96,6 +102,7 @@ async def require_caller(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing credentials; pass 'Authorization: Bearer <api-key>' or 'X-API-Key'",
+            headers=_WWW_AUTH,
         )
     try:
         caller = authenticate(token)
