@@ -363,7 +363,9 @@ rag-engine/
 │   │   ├── ratelimit.py           # per-key fixed-window limiter (Redis, fail-open)
 │   │   ├── ownership.py           # task_owner stamps + /tasks tenancy verification
 │   │   ├── metrics.py             # in-process Prometheus exposition builder
+│   │   ├── relevance.py           # relevance gate (refuse before generation)
 │   │   ├── deps.py                # SessionDep
+│   │   ├── static/ui.html         # test UI served at /ui (DOCS_ENABLED=true)
 │   │   └── routes/
 │   │       ├── ingest.py          # POST /ingest (records task owner)
 │   │       ├── query.py           # POST /query
@@ -492,8 +494,9 @@ and writes **its own workspace only**. `401` responses carry
 `WWW-Authenticate: Bearer` (RFC 6750), and every credential also passes the
 per-key rate limiter — bursts answer `429` + `Retry-After` (see
 [Rate limiting](#rate-limiting)). The interactive docs (`/docs`, `/openapi.json`)
-are disabled unless `DOCS_ENABLED=true` — they cannot be authenticated, so
-they are off in production.
+and the browser **test UI** (`/ui`, see below) are disabled unless
+`DOCS_ENABLED=true` — they cannot be authenticated, so they are off in
+production.
 
 ### `POST /ingest`
 
@@ -680,6 +683,30 @@ is unreachable. Use this for liveness/ready probes.
 
 ---
 
+### `GET /ui` *(docs toggle)*
+
+A browser test UI for the whole surface — served as a single static HTML/JS
+file (`api/static/ui.html`, no build step, no dependencies) when
+`DOCS_ENABLED=true`, off otherwise. It is unauthenticated itself and only
+calls the already-authenticated endpoints above:
+
+- paste an API key (kept in the browser's `localStorage`, sent as
+  `Authorization: Bearer`) — the workspace that key belongs to is what you
+  see, so tenancy is exercised naturally;
+- ask a question against `/query/stream` with live token rendering, the
+  citations event listed first, and `event: error` (relevance-gate refusal or
+  mid-stream LLM failure) shown inline — or uncheck *stream* to use blocking
+  `/query` and see `retrieved`/`reranked`;
+- upload a file to `/ingest` (admin key) and watch `/tasks/{id}` poll to
+  `SUCCESS`/`FAILURE`.
+
+Caveats worth knowing: the key sits in the browser's localStorage until you
+hit *Forget* — fine for a dev machine, don't reuse it as an internal tool on
+shared browsers; and it is a **test** UI, not a product frontend — the
+battery (`scripts/manual_test.sh`) remains the real harness.
+
+---
+
 ### `GET /metrics` *(admin only)*
 
 Prometheus text exposition (format 0.0.4) for the running API process. Reads
@@ -743,7 +770,7 @@ All settings resolve in this order (highest priority first):
 | `RATE_LIMIT_ENABLED` | `true` | Per-key fixed-window limiter (`false` bypasses it; Redis failures always fail open regardless) |
 | `RATE_LIMIT_PER_MINUTE` | `60` | Sustained burst ceiling per API key — exceeded ⇒ `429` + `Retry-After` |
 | `RATE_LIMIT_PER_HOUR` | `1200` | Abuse ceiling per API key per hour; `0` disables this window individually |
-| `DOCS_ENABLED` | `false` | Serve unauthenticated `/docs`, `/redoc`, `/openapi.json`. Off by default (they leak the full API schema to anonymous callers); enable for development only |
+| `DOCS_ENABLED` | `false` | Serve the unauthenticated development conveniences: `/docs`, `/redoc`, `/openapi.json` (they leak the full API schema) and the browser test UI at `/ui`. Off by default; enable for development only |
 
 **Setting these correctly matters.** A `DATABASE_URL` on 5432 will connect to a
 local Homebrew Postgres if one is running, and the failure will be

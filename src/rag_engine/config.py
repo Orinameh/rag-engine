@@ -84,7 +84,8 @@ class Settings(BaseSettings):
     # even when the query passes the gate (tail-noise guard). 0 = keep top-N.
     rerank_chunk_min_score: float = 0.10
 
-    # Unauthenticated /docs, /redoc, /openapi.json are off by default
+    # Unauthenticated dev conveniences (/docs, /redoc, /openapi.json and the
+    # test UI at /ui) are off by default
     # (app.py). Enable only for development.
     docs_enabled: bool = False
 

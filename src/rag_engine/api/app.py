@@ -2,6 +2,7 @@ import asyncio
 import logging
 from collections.abc import AsyncGenerator  # ← AsyncGenerator, not AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from time import perf_counter
 
 from fastapi import FastAPI
@@ -88,10 +89,11 @@ async def metrics_middleware(request: Request, call_next):  # type: ignore[no-un
             logger.debug("metrics recording failed: %s", exc)
 
 
-# Interactive docs (/docs, /redoc, /openapi.json) are OFF by default: they
-# are unauthenticated by nature and handing anonymous callers the full API
-# schema is pointless surface for a production deployment. Set
-# DOCS_ENABLED=true for development convenience.
+# Development conveniences (/docs, /redoc, /openapi.json and the test UI at
+# /ui) are OFF by default: the first three are unauthenticated by nature and
+# handing anonymous callers the full API schema is pointless surface for a
+# production deployment, and the test UI is a dev tool, not a product. Set
+# DOCS_ENABLED=true to turn them all on.
 app = FastAPI(
     title="RAG Engine",
     version="0.1.0",
@@ -100,6 +102,17 @@ app = FastAPI(
     redoc_url="/redoc" if get_settings().docs_enabled else None,
     openapi_url="/openapi.json" if get_settings().docs_enabled else None,
 )
+
+if get_settings().docs_enabled:
+    from fastapi.responses import FileResponse
+
+    # Single static HTML/JS file, no build step (api/static/ui.html). Served
+    # unauthenticated — it only calls the already-authenticated API routes.
+    _ui_html = Path(__file__).parent / "static" / "ui.html"
+
+    @app.get("/ui", include_in_schema=False)
+    async def ui_page() -> FileResponse:
+        return FileResponse(_ui_html, media_type="text/html")
 
 app.middleware("http")(metrics_middleware)
 

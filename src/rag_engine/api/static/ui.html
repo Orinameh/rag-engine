@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<!--
+  Minimal test UI for the RAG engine (served at /ui when DOCS_ENABLED=true —
+  same dev-convenience toggle as /docs; not a product frontend).
+
+  - One static file, zero dependencies, no build step.
+  - The API key you paste is kept in this browser's localStorage and sent as
+    `Authorization: Bearer ...` — the engine never sees or stores it here.
+  - Everything the API returns is rendered via textContent (no innerHTML):
+    document content is untrusted data, so it can never execute as markup.
+  - Streaming answers use POST + ReadableStream (EventSource can't POST), and
+    parse the same SSE events the API emits: citations → token… → done, with
+    `error` for gate refusals and mid-stream LLM failures.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAG Engine — test UI</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.2rem; } h2 { font-size: 1rem; margin-top: 2rem; }
+  label { display: block; margin: .5rem 0 .2rem; font-weight: 600; }
+  input, textarea, select, button { font: inherit; }
+  input[type=text], input[type=password], textarea, select {
+    width: 100%; box-sizing: border-box; padding: .4rem .5rem;
+    border: 1px solid #8886; border-radius: 6px; background: transparent; color: inherit;
+  }
+  textarea { min-height: 4.5rem; resize: vertical; }
+  button { padding: .4rem .9rem; border-radius: 6px; border: 1px solid #8886; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: .6rem; align-items: center; }
+  .row > *:first-child { flex: 1; }
+  #answer { white-space: pre-wrap; border-left: 3px solid #8884; padding-left: .8rem; margin: .8rem 0; min-height: 1.5rem; }
+  .cites { color: #777; font-size: .85rem; }
+  .error { color: #c0392b; }
+  .ok { color: #1e8449; }
+  .muted { color: #888; }
+  .hidden { display: none; }
+  fieldset { border: 1px solid #8883; border-radius: 8px; margin: 0 0 1.5rem; }
+</style>
+</head>
+<body>
+<h1>RAG Engine test UI</h1>
+<p class="muted">The API key stays in this browser's localStorage and is sent only as a Bearer header. Whatever workspace it belongs to is what you see.</p>
+
+<h2>Credentials</h2>
+<fieldset>
+  <label for="key">API key (Bearer)</label>
+  <div class="row">
+    <input id="key" type="password" placeholder="sk-acme-reader" autocomplete="off">
+    <button id="saveKey">Save</button>
+    <button id="forgetKey">Forget</button>
+  </div>
+  <div id="keyStatus" class="muted"></div>
+</fieldset>
+
+<h2>Query</h2>
+<fieldset>
+  <label for="question">Question</label>
+  <textarea id="question" placeholder="What is the maximum operating temperature?"></textarea>
+  <div class="row" style="margin:.6rem 0">
+    <span><input type="checkbox" id="stream" checked> <label for="stream" style="display:inline;font-weight:400">stream (<code>/query/stream</code>); unchecked uses blocking <code>/query</code></label></span>
+    <button id="ask">Ask</button>
+  </div>
+  <div id="queryMeta" class="muted"></div>
+  <div id="answer"></div>
+  <div id="citations" class="cites"></div>
+  <div id="queryError" class="error"></div>
+</fieldset>
+
+<h2>Ingest (admin key required)</h2>
+<fieldset>
+  <div class="row">
+    <input id="file" type="file" accept=".pdf,.docx,.html,.htm,.md">
+    <button id="ingest">Upload</button>
+  </div>
+  <label for="title">Title</label>
+  <input id="title" type="text" placeholder="Acme Runbook">
+  <label for="authority">Authority</label>
+  <select id="authority">
+    <option value="official">official</option>
+    <option value="unknown">unknown</option>
+  </select>
+  <div id="ingestStatus" class="muted"></div>
+</fieldset>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+// --- credentials -----------------------------------------------------------
+const keyInput = $("key");
+keyInput.value = localStorage.getItem("rag_ui_key") ?? "";
+function keyStatus(msg, cls) { $("keyStatus").textContent = msg; if (cls) $("keyStatus").className = cls; }
+$("saveKey").onclick = () => {
+  localStorage.setItem("rag_ui_key", keyInput.value.trim());
+  keyStatus("key saved in localStorage (forget it before closing a shared browser)", "ok");
+};
+$("forgetKey").onclick = () => {
+  localStorage.removeItem("rag_ui_key");
+  keyInput.value = "";
+  keyStatus("key forgotten", "");
+};
+keyStatus(keyInput.value ? "key loaded from localStorage" : "no key stored");
+
+function authHeaders() {
+  const key = keyInput.value.trim();
+  if (!key) { keyStatus("paste an API key first", "error"); return null; }
+  return { "Authorization": "Bearer " + key };
+}
+
+async function apiError(res) {
+  // Surface 4xx/5xx detail without dumping internals.
+  let detail = res.statusText;
+  try { detail = (await res.json()).detail ?? detail; } catch { /* non-JSON body */ }
+  if (typeof detail !== "string") detail = JSON.stringify(detail);
+  return res.status + " " + detail;
+}
+
+// --- query (streaming) ------------------------------------------------------
+const ask = $("ask");
+function setBusy(b) { ask.disabled = b; ask.textContent = b ? "…" : "Ask"; }
+
+async function askStream(question) {
+  const res = await fetch("/query/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ question }),
+  });
+  if (!res.ok || !res.body) throw new Error(await apiError(res));
+
+  // Parse SSE frames. Line terminators are \r\n, \n, or \r per the SSE spec —
+  // sse-starlette uses \r\n, so splitting only on "\n\n" would (and did,
+  // until tested) parse zero events. Multiple data lines join with \n
+  // (sse_starlette splits tokens on newlines).
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const FRAME_SEP = /\r\n\r\n|\n\n|\r\r/;
+  let buf = "";
+  let sawDone = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep;
+    while ((sep = FRAME_SEP.exec(buf)) !== null) {
+      const block = buf.slice(0, sep.index);
+      buf = buf.slice(sep.index + sep[0].length);
+      let event = "message";
+      const data = [];
+      for (const line of block.split(/\r\n|\r|\n/)) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+      }
+      if (event === "citations") renderCitations(JSON.parse(data.join("\n")));
+      else if (event === "token") $("answer").append(data.join("\n"));
+      else if (event === "done") { sawDone = true; $("queryMeta").textContent = "stream complete"; }
+      else if (event === "error") {
+        sawDone = true; // gate refusals / LLM failures close the stream cleanly
+        const span = document.createElement("span");
+        span.className = "error";
+        span.textContent = data.join("\n");
+        $("queryMeta").replaceChildren(span);
+      }
+    }
+  }
+  if (!sawDone) $("queryMeta").textContent = "stream ended without done — incomplete response";
+}
+
+async function askBlocking(question) {
+  const res = await fetch("/query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ question }),
+  });
+  if (!res.ok) throw new Error(await apiError(res));
+  const body = await res.json();
+  $("answer").textContent = body.answer;
+  $("queryMeta").textContent = `retrieved ${body.retrieved}, reranked ${body.reranked}`;
+  renderCitations(body.citations ?? []);
+}
+
+function renderCitations(cites) {
+  const ul = document.createElement("ul");
+  for (const c of cites) {
+    const li = document.createElement("li");
+    const short = c.doc_id ? c.doc_id.slice(0, 8) : "?";
+    li.textContent = `[SOURCE ${c.source}] ${c.title ?? "(untitled)"} · doc ${short}` +
+      (c.page != null ? ` · p.${c.page}` : "");
+    ul.append(li);
+  }
+  $("citations").replaceChildren(ul);
+}
+
+ask.onclick = async () => {
+  const question = $("question").value.trim();
+  if (!question) return;
+  $("answer").textContent = "";
+  $("citations").textContent = "";
+  $("queryMeta").textContent = "";
+  $("queryError").textContent = "";
+  setBusy(true);
+  try {
+    await ($("stream").checked ? askStream(question) : askBlocking(question));
+  } catch (err) {
+    $("queryError").textContent = String(err.message || err);
+  } finally {
+    setBusy(false);
+  }
+};
+
+// --- ingest + task polling ---------------------------------------------------
+$("ingest").onclick = async () => {
+  const file = $("file").files[0];
+  const status = $("ingestStatus");
+  status.textContent = "";
+  if (!file) { status.textContent = "choose a file first"; return; }
+  const form = new FormData();
+  form.append("file", file);
+  form.append("title", $("title").value.trim() || file.name);
+  form.append("authority", $("authority").value);
+  status.textContent = "uploading…";
+  try {
+    const res = await fetch("/ingest", { method: "POST", headers: authHeaders(), body: form });
+    if (!res.ok) throw new Error(await apiError(res));
+    const { task_id } = await res.json();
+    status.textContent = `task ${task_id.slice(0, 8)}… queued`;
+    await pollTask(task_id, status);
+  } catch (err) {
+    status.textContent = String(err.message || err);
+    status.className = "error";
+  }
+};
+
+async function pollTask(taskId, status) {
+  for (let i = 0; i < 300; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const res = await fetch(`/tasks/${taskId}`, { headers: authHeaders() });
+    if (!res.ok) throw new Error(await apiError(res));
+    const body = await res.json();
+    status.textContent = `task ${taskId.slice(0, 8)}… ${body.state}`;
+    if (body.state === "FAILURE") throw new Error(body.result?.error ?? "task failed");
+    if (body.state === "SUCCESS") {
+      const r = body.result ?? {};
+      status.textContent = `done: doc ${String(r.doc_id ?? "").slice(0, 8)}, ${r.chunks ?? "?"} chunk(s)`;
+      status.className = "ok";
+      return;
+    }
+  }
+  throw new Error("timed out polling task");
+}
+</script>
+</body>
+</html>
