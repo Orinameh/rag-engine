@@ -585,6 +585,23 @@ Blocking retrieval + answer.
   injects the workspace scope and it wins over anything the client sends.
 - `top_k` caps candidates entering the reranker (default 40, max 100, min 1).
 
+**Relevance gate:** if the top-1 reranker score falls below `RERANK_MIN_SCORE`
+(default 0.50), the query is refused **before** the LLM runs — no hallucination
+path, no token cost:
+
+```json
+{
+  "answer": "no relevant material found in this workspace for that question",
+  "citations": [],
+  "retrieved": 3,
+  "reranked": 0
+}
+```
+
+Retrieval itself is similarity-based and never says "not in corpus" — the
+gate is the calibrated number that makes that call (re-tune with
+`scripts/calibrate_gate.py` if you change the reranker model or corpus).
+
 **Response:**
 
 ```json
@@ -626,6 +643,11 @@ Citations arrive **before** the LLM starts generating. Retrieval and rerank
 complete before the first byte of the stream. If the LLM fails mid-stream, an
 explicit `event: error` is emitted (clients should treat a stream that closes
 without `done` as incomplete) — earlier versions left such clients hanging.
+
+The **relevance gate** also refuses on the stream: a question whose top rerank
+score is below `RERANK_MIN_SCORE` gets `event: error` with
+`no relevant material found…` and the stream closes — no `citations`, no
+`token` events, and the generator never runs.
 
 **Client example (JavaScript):**
 
@@ -710,6 +732,8 @@ All settings resolve in this order (highest priority first):
 | `CHUNK_OVERLAP` | `120` | Tokens |
 | `RETRIEVAL_TOP_K` | `40` | After **RRF** |
 | `RERANK_TOP_N` | `8` | Fed to LLM |
+| `RERANK_MIN_SCORE` | `0.50` | Relevance gate: top-1 rerank score below this ⇒ the query is refused *before* generation (`no relevant material found…`, no LLM call). Calibrated on bge-reranker sigmoid scores: on-corpus ≈ 0.98+, off-corpus ≈ 0.0 (`scripts/calibrate_gate.py`); `0` disables the gate |
+| `RERANK_CHUNK_MIN_SCORE` | `0.10` | Per-chunk floor: chunks under this score are trimmed from the context even when the query passes the gate (tail-noise guard); `0` keeps pure top-N ranking |
 | `RRF_K` | `60` | RRF constant |
 | `MAX_CONTEXT_TOKENS` | `3000` | Hard cap on assembled context |
 | `UPLOAD_MAX_BYTES` | `64 MB` | Per-file upload cap (larger → HTTP 413) |
@@ -1418,16 +1442,17 @@ uv run pytest -v
 ### Integration test (live stack)
 
 `scripts/manual_test.sh` exercises the whole stack against a running API +
-worker — 31 checks covering auth, RBAC, upload validation, idempotent
+worker — 35 checks covering auth, RBAC, upload validation, idempotent
 re-ingest, cross-workspace isolation, streaming, error handling, task
-tenancy (`404` for foreign task ids), metrics role-gating, and `429` on a
+tenancy (`404` for foreign task ids), metrics role-gating, the relevance
+gate (off-corpus questions refuse before generation), and `429` on a
 rate-limit burst:
 
 ```bash
 # Prereqs: `docker compose up -d`, worker + API running (see Quickstart),
 # 4 API keys configured (acme admin/reader, globex admin/reader).
 bash scripts/manual_test.sh
-# → "=== 31 passed, 0 failed ==="
+# → "=== 35 passed, 0 failed ==="
 ```
 
 The battery is idempotent: re-running the same documents yields

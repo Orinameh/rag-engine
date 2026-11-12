@@ -4,7 +4,7 @@
 # NOTE: the query tests need a real LLM_API_KEY; they still run and are
 # expected to fail with 502 while the key is placeholder.
 set -u
-BASE=http://localhost:8000
+BASE=${BASE:-http://localhost:8000}
 PASS=0; FAIL=0
 
 check() { # name, expected-substring, actual body (raw match)
@@ -170,7 +170,20 @@ M=$(curl -s "$BASE/metrics" -H "X-API-Key: sk-acme-admin")
 not_in "exposition never leaks key material" "sk-" "$M"
 grep -q "rag_engine_requests_total" <<<"$M" && { echo "✅ exposition has request counters"; PASS=$((PASS+1)); } || { echo "❌ no request counter"; FAIL=$((FAIL+1)); }
 
-echo "== 13. Rate limiting: 429 on burst =="
+echo "== 13. Relevance gate: off-corpus question refuses before the LLM =="
+# Uses the acme-reader key BEFORE the burst below drains its minute budget.
+B=$(curl -s -m 30 -X POST "$BASE/query" -H "Authorization: Bearer sk-acme-reader" -H "Content-Type: application/json" -d '{"question":"How long do I boil an egg for?"}')
+if grep -q "no relevant material" <<<"$B"; then
+  echo "✅ off-corpus /query refused (no LLM call)"; PASS=$((PASS+1))
+else
+  echo "❌ off-corpus query not refused: ${B:0:200}"; FAIL=$((FAIL+1))
+fi
+SSE=$(curl -s -m 30 -N -X POST "$BASE/query/stream" -H "Authorization: Bearer sk-acme-reader" -H "Content-Type: application/json" -d '{"question":"What is the capital of France?"}')
+check "off-corpus stream → error event" "event: error" "$SSE"
+check "stream refusal says no relevant material" "no relevant material" "$SSE"
+not_in "refused stream produced no tokens" "event: token" "$SSE"
+
+echo "== 14. Rate limiting: 429 on burst =="
 # 65 fast authed polls as one reader: per-minute limit is 60 → the tail must
 # start answering 429 with Retry-After. (Do this last: it exhausts the key's
 # minute budget and would pollute later sections.)

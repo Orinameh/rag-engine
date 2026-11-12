@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
 from rag_engine.api.auth import CallerDep, scoped_metadata_filter
+from rag_engine.api.relevance import apply_relevance_gate
 from rag_engine.api.routes.query import QueryRequest
 from rag_engine.config import get_settings
 from rag_engine.db import SessionFactory
@@ -54,10 +55,18 @@ async def query_stream(body: QueryRequest, caller: CallerDep) -> EventSourceResp
         c.setdefault("metadata", {})
         c["metadata"]["title"] = docs.get(c["doc_id"])
 
+    # Relevance gate: an SSE refusal is an explicit `error` event followed by
+    # close — machine-readable, and the generator never runs (see
+    # api/relevance.py; /query answers 200 with the same message).
+    top, refusal = apply_relevance_gate(top)
+    # build_context([]) yields ("", []) — keeps context a str on either path.
     context, citations = build_context(top, max_tokens=s.max_context_tokens)
 
     # Phase 2: stream tokens (no DB)
     async def event_gen():
+        if refusal is not None:
+            yield {"event": "error", "data": refusal}
+            return
         yield {"event": "citations", "data": orjson.dumps(citations).decode()}
         try:
             async for token in generate_answer_stream(body.question, context):

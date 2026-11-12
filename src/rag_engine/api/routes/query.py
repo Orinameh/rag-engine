@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from rag_engine.api.auth import CallerDep, scoped_metadata_filter
 from rag_engine.api.deps import SessionDep
+from rag_engine.api.relevance import apply_relevance_gate
 from rag_engine.config import get_settings
 from rag_engine.generation.llm import generate_answer
 from rag_engine.models import Document
@@ -56,6 +57,17 @@ async def query(
         metadata_filter=scoped_metadata_filter(body.metadata_filter, caller.workspace),
     )
     top = await asyncio.to_thread(rerank, body.question, candidates, s.rerank_top_n)
+
+    # Relevance gate: refuse before the LLM when nothing actually matches
+    # (see api/relevance.py) — 200 with an honest answer, no citations.
+    top, refusal = apply_relevance_gate(top)
+    if refusal:
+        return QueryResponse(
+            answer=refusal,
+            citations=[],
+            retrieved=len(candidates),
+            reranked=len(top),
+        )
 
     doc_ids = {c["doc_id"] for c in top}
     docs = {

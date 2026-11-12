@@ -74,6 +74,16 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 60
     rate_limit_per_hour: int = 1200
 
+    # Relevance gate (api/relevance.py): if the top-1 rerank score is below
+    # rerank_min_score, the query is refused ("no relevant material") BEFORE
+    # the LLM runs — no hallucination path, no token cost. Calibrated on the
+    # live profile (scripts/calibrate_gate.py): on-corpus ~0.98+, off-corpus
+    # ~0.0; 0.50 sits mid-gap. 0 disables the gate.
+    rerank_min_score: float = 0.50
+    # Per-chunk floor: chunks under this score are trimmed from the context
+    # even when the query passes the gate (tail-noise guard). 0 = keep top-N.
+    rerank_chunk_min_score: float = 0.10
+
     # Unauthenticated /docs, /redoc, /openapi.json are off by default
     # (app.py). Enable only for development.
     docs_enabled: bool = False
