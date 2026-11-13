@@ -526,7 +526,13 @@ client-supplied filename; path traversal via `filename` is not possible.
 }
 ```
 
-- `415` — unsupported file type (allowed: `.pdf`, `.docx`, `.html`, `.htm`, `.md`)
+- `415` — unsupported file type (allowed: `.pdf`, `.docx`, `.html`, `.htm`,
+  `.md`), **or** the content's magic bytes don't match the claimed type — a
+  shell script renamed `.pdf`, a PE binary renamed `.md`, a PDF renamed
+  `.docx`. The extension is client-supplied and untrusted, so the first
+  uploaded chunk is sniffed before anything is stored; a ZIP renamed `.docx`
+  passes that header check (a real docx *is* a zip) and dies as a clean task
+  `FAILURE` in the parser instead
 - `413` — file exceeds `UPLOAD_MAX_BYTES` (default 64 MB). The file is streamed
   and rejected mid-upload, so oversized bodies never land on disk.
 - `401` / `403` — missing/invalid key, or the key's role is not `admin`
@@ -969,7 +975,12 @@ LLM call, `build_context` applies two layers (`retrieval/sanitize.py`) :
 Sanitization happens at prompt-build time; stored text and embeddings keep
 full fidelity, and the sanitizer can evolve without re-indexing. The
 hardening is covered by `tests/test_sanitize.py` (fence breakouts, role
-spoofing, truncation with an open fence, and more).
+spoofing, truncation with an open fence, and more), and
+`tests/test_prompt_guard.py` locks the system-prompt rules themselves — the
+prompt is a plain string with no schema, so a future edit dropping the
+"DATA, not instructions" contract would otherwise fail invisibly. Honest
+residual risk: enforcement is prompt-level on a (small) generator model;
+these layers raise the bar, they do not make injection impossible.
 
 `build_context` numbers chunks as `[SOURCE 1]`, `[SOURCE 2]`, … and returns a
 parallel `citations` list mapping source numbers to `{doc_id, title, page}`.
@@ -1423,6 +1434,8 @@ disables the rate limiter everywhere except its own tests):
 |---|---|
 | `tests/test_metrics.py` | `recall_at_k`, `mrr`, `ndcg_at_k` correctness and bounds |
 | `tests/test_sanitize.py` | Prompt-injection hardening: fence breakouts, role spoofing, special-token and control-character neutralization, truncation keeps fences closed |
+| `tests/test_prompt_guard.py` | The system prompt's injection rules (data fence, no override, question-is-the-only-instruction, citation contract) — locks the prompt against silent regression on future edits |
+| `tests/test_upload_validation.py` | Magic-byte sniffing: real headers, mislabeled payloads (shell/ELF/PE renamed), short/empty heads fail closed |
 | `tests/test_pii.py` | PII detection/masking per class, Luhn false-positive control, `pseudonymize` determinism, policy wiring in `build_context` (`off`/`llm_only`/`all`) |
 | `tests/test_auth.py` | Bearer/`X-API-Key` parsing, unknown-key `401`, role gating |
 | `tests/test_key_storage.py` | `RAG_API_KEYS` hashed storage: digest map build, blank-key drop, env replacement (revocation) semantics |
@@ -1469,7 +1482,8 @@ uv run pytest -v
 ### Integration test (live stack)
 
 `scripts/manual_test.sh` exercises the whole stack against a running API +
-worker — 35 checks covering auth, RBAC, upload validation, idempotent
+worker — 38 checks covering auth, RBAC, upload validation (type, size,
+magic-byte mismatch), idempotent
 re-ingest, cross-workspace isolation, streaming, error handling, task
 tenancy (`404` for foreign task ids), metrics role-gating, the relevance
 gate (off-corpus questions refuse before generation), and `429` on a
@@ -1479,7 +1493,7 @@ rate-limit burst:
 # Prereqs: `docker compose up -d`, worker + API running (see Quickstart),
 # 4 API keys configured (acme admin/reader, globex admin/reader).
 bash scripts/manual_test.sh
-# → "=== 35 passed, 0 failed ==="
+# → "=== 38 passed, 0 failed ==="
 ```
 
 The battery is idempotent: re-running the same documents yields
@@ -1777,6 +1791,12 @@ Two distinct causes, both seen in practice:
 - **Memory recycling** — the worker hit `worker_max_memory_per_child`
   (1.5 GB) or the OS OOM-killed the child. Check `docker stats` and the worker
   log. Reduce `EMBED_BATCH` in `worker.py` from 64 to 32 or 16.
+- **Soft time limit** — a task that exceeds `task_soft_time_limit` (600 s;
+  e.g. a decompression-bomb document the parser expands enormously) raises
+  `SoftTimeLimitExceeded`, which surfaces as a clean permanent `FAILURE` with
+  that name in the error message — bounded worker occupancy instead of the
+  silent 30-min hang the hard `task_time_limit=1800` used to be the only
+  guard against.
 - **Child churn on macOS** — repeated
   `Timed out waiting for UP message from SpawnPoolWorker` + `signal 9` even
   on a big-RAM machine: each spawn child re-imports torch/model stacks at

@@ -124,14 +124,22 @@ not_in "no error event" "event: error" "$SSE_LINES"
 FIRST_EVT=$(echo "$SSE" | grep '^event:' | head -1)
 check "first event is citations" "event: citations" "$FIRST_EVT"
 
-echo "== 10. Corrupt PDF → clean permanent FAILURE =="
+echo "== 10. Malformed PDF: rejected at the API or cleanly failed in the worker =="
+# (a) Random bytes as .pdf: the magic-byte check rejects at upload (415), no
+# task is ever created, the worker never sees it.
 head -c 4096 /dev/urandom > /tmp/corrupt.pdf
-curl -s -X POST "$BASE/ingest" -H "Authorization: Bearer sk-acme-admin" -F "file=@/tmp/corrupt.pdf" -F "title=corrupt" > /tmp/last_body
+C=$(curl -s -X POST "$BASE/ingest" -H "Authorization: Bearer sk-acme-admin" -F "file=@/tmp/corrupt.pdf" -F "title=corrupt")
+check "random bytes renamed .pdf → 415 magic-byte mismatch" "magic-byte mismatch" "$C"
+# (b) A valid %PDF header followed by garbage passes the sniff (it IS pdf-
+# shaped) and must die as a clean permanent FAILURE in the worker — with a
+# short error message, never a traceback.
+{ printf '%%PDF-1.4\n'; head -c 4096 /dev/urandom; } > /tmp/garbage.pdf
+curl -s -X POST "$BASE/ingest" -H "Authorization: Bearer sk-acme-admin" -F "file=@/tmp/garbage.pdf" -F "title=garbage" > /tmp/last_body
 CT=$(jqfield task_id)
 B=$(poll_task "$CT" "X-API-Key: sk-acme-reader")
 STATE=$(python3 -c "import json;print(json.load(open('/tmp/task_body')).get('state',''))" 2>/dev/null)
 if [[ "$STATE" == "FAILURE" && "$B" == *'"error"'* ]]; then
-  echo "✅ corrupt pdf → FAILURE with {'error'}"; PASS=$((PASS+1))
+  echo "✅ garbage pdf → FAILURE with {'error'}"; PASS=$((PASS+1))
 else
   echo "❌ corrupt handling — state=$STATE body=${B:0:200}"; FAIL=$((FAIL+1))
 fi
@@ -169,6 +177,15 @@ if [[ "$C" == "401" ]]; then echo "✅ anon scrape → 401"; PASS=$((PASS+1)); e
 M=$(curl -s "$BASE/metrics" -H "X-API-Key: sk-acme-admin")
 not_in "exposition never leaks key material" "sk-" "$M"
 grep -q "rag_engine_requests_total" <<<"$M" && { echo "✅ exposition has request counters"; PASS=$((PASS+1)); } || { echo "❌ no request counter"; FAIL=$((FAIL+1)); }
+
+echo "== 12b. Magic-byte sniffing: mislabeled uploads rejected =="
+printf '#!/bin/sh\nrm -rf /\n' > "/tmp/mt_evil.pdf"
+C=$(curl -s -m 30 -X POST "$BASE/ingest" -H "X-API-Key: sk-acme-admin" -F "file=@/tmp/mt_evil.pdf" -F "title=Evil")
+check "shell script renamed .pdf → 415" "magic-byte mismatch" "$C"
+printf 'MZ\x90\x00\x03\x00\x00\x00binary' > "/tmp/mt_evil.md"
+C=$(curl -s -m 30 -X POST "$BASE/ingest" -H "X-API-Key: sk-acme-admin" -F "file=@/tmp/mt_evil.md" -F "title=Evil")
+check "PE binary renamed .md → 415" "magic-byte mismatch" "$C"
+rm -f /tmp/mt_evil.pdf /tmp/mt_evil.md
 
 echo "== 13. Relevance gate: off-corpus question refuses before the LLM =="
 # Uses the acme-reader key BEFORE the burst below drains its minute budget.

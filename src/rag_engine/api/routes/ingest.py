@@ -19,6 +19,32 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_CHUNK = 1 << 20  # 1 MB read chunks
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".html", ".htm", ".md"}
 
+# Magic bytes for formats that have them. The extension comes from the
+# client-supplied filename, so it is untrusted — these checks make a file
+# named "report.pdf" that is really a ZIP or ELF fail at the API (415)
+# instead of costing the worker a parse attempt.
+_MAGIC_HEADERS = {
+    ".pdf": b"%PDF",
+    ".docx": b"PK\x03\x04",  # ZIP local file header (OOXML container)
+}
+
+
+def _content_matches_ext(ext: str, head: bytes) -> bool:
+    """True when the first bytes agree with the claimed extension.
+
+    Formats without a fixed magic (.html/.htm/.md) are validated negatively:
+    binary payloads masquerading as text almost always contain NUL bytes in
+    their head. An empty head (0-byte upload) passes for text formats — the
+    parser turns it into a clean "empty" result — but fails for .pdf/.docx,
+    which cannot be meaningfully empty.
+    """
+    magic = _MAGIC_HEADERS.get(ext)
+    if magic is not None:
+        # head may be shorter than the magic for a pathologically tiny file;
+        # startswith then fails, which is the safe answer.
+        return head.startswith(magic)
+    return b"\x00" not in head
+
 
 class IngestResponse(BaseModel):
     task_id: str
@@ -52,6 +78,7 @@ async def ingest(
     tmp = UPLOAD_DIR / workspace / f".tmp-{uuid.uuid4()}{ext}"
     try:
         tmp.parent.mkdir(parents=True, exist_ok=True)
+        first = True
         with tmp.open("wb") as out:
             while chunk := await file.read(UPLOAD_CHUNK):
                 size += len(chunk)
@@ -60,6 +87,17 @@ async def ingest(
                         status_code=413,
                         detail=f"File exceeds the {s.upload_max_bytes // (1024 * 1024)} MB upload limit",
                     )
+                if first:
+                    # Content sniff on the very first chunk, before anything is
+                    # kept: the extension was client-supplied, bytes are the
+                    # truth. tmp is unlinked by the handler below.
+                    if not _content_matches_ext(ext, chunk):
+                        raise HTTPException(
+                            status_code=415,
+                            detail=f"File content does not look like {ext!r} "
+                            "(magic-byte mismatch)",
+                        )
+                    first = False
                 digest.update(chunk)
                 out.write(chunk)
         dest = UPLOAD_DIR / workspace / f"{digest.hexdigest()}{ext}"

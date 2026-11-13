@@ -44,11 +44,17 @@ celery_app.conf.update(
     task_track_started=True,
     broker_connection_retry_on_startup=True,
     task_time_limit=1800,
+    # Soft limit first: a decompression-bomb upload (a "10 MB" PDF the parser
+    # expands to gigabytes) raises SoftTimeLimitExceeded at 10 min, which the
+    # task's generic handler wraps into a clean permanent FAILURE — bounded
+    # worker occupancy instead of a silent 30-min hang. Must be < task_time_limit.
+    task_soft_time_limit=600,
     worker_max_tasks_per_child=25,
     worker_max_memory_per_child=1_500_000,  # 1.5 GB → hard recycle
     # Fail fast on a lost broker instead of silently draining an orphan queue.
     worker_cancel_long_running_tasks_on_connection_loss=True,
 )
+
 
 def _fresh_session() -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
     """Engine + sessionmaker scoped to *this* event loop.
@@ -107,7 +113,9 @@ def ingest_document(
 async def _ingest_async(path: str, title: str, authority: str, workspace: str) -> dict:
     engine, Session = _fresh_session()
     try:
-        return await _ingest_with_session(engine, Session, path, title, authority, workspace)
+        return await _ingest_with_session(
+            engine, Session, path, title, authority, workspace
+        )
     finally:
         # Closes this loop's connections; never touches a previous loop's pool.
         await engine.dispose()
